@@ -2,6 +2,8 @@ from .paper_reader import read_paper
 from .paper_chunker import split_into_chunks
 from .chunk_analyzer import analyze_chunk
 from .synthesizer import synthesize_analyses
+from .research_report import build_research_report
+
 
 def run_research_pipeline(
     topic: str,
@@ -9,7 +11,7 @@ def run_research_pipeline(
     max_chunks: int = 3,
 ):
     """
-    Minimal end-to-end ResearchPilot pipeline.
+    End-to-end ResearchPilot research pipeline.
 
     Topic
       ↓
@@ -18,6 +20,10 @@ def run_research_pipeline(
     Chunk paper
       ↓
     Analyze chunks
+      ↓
+    Synthesize findings
+      ↓
+    Build research report
       ↓
     Return research state
     """
@@ -32,7 +38,7 @@ def run_research_pipeline(
     # 1. READ
     # --------------------------------------------------
 
-    print("\n[1/3] Reading paper...")
+    print("\n[1/5] Reading paper...")
 
     paper = read_paper(paper_url)
 
@@ -44,7 +50,7 @@ def run_research_pipeline(
     # 2. CHUNK
     # --------------------------------------------------
 
-    print("\n[2/3] Creating chunks...")
+    print("\n[2/5] Creating chunks...")
 
     chunks = split_into_chunks(
         paper["pages"],
@@ -60,13 +66,16 @@ def run_research_pipeline(
     # 3. ANALYZE
     # --------------------------------------------------
 
-    print("\n[3/3] Analyzing chunks...")
+    print("\n[3/5] Analyzing chunks...")
 
     analyses = []
 
     chunks_to_process = chunks[:max_chunks]
 
-    for index, chunk in enumerate(chunks_to_process, start=1):
+    for index, chunk in enumerate(
+        chunks_to_process,
+        start=1,
+    ):
 
         print(
             f"      → Analyzing chunk "
@@ -80,13 +89,11 @@ def run_research_pipeline(
 
         print("        ✓ complete")
 
-        
-
     # --------------------------------------------------
     # 4. SYNTHESIZE
     # --------------------------------------------------
 
-    print("\n[4/4] Synthesizing research findings...")
+    print("\n[4/5] Synthesizing research findings...")
 
     synthesis = synthesize_analyses(
         topic=topic,
@@ -94,25 +101,48 @@ def run_research_pipeline(
     )
 
     print("      ✓ synthesis complete")
+
+    # --------------------------------------------------
+    # 5. REPORT
+    # --------------------------------------------------
+
+    print("\n[5/5] Building research report...")
+
+    report = build_research_report(
+        topic=topic,
+        synthesis=synthesis,
+    )
+
+    print("      ✓ research report built")
+
     # --------------------------------------------------
     # RESEARCH STATE
     # --------------------------------------------------
 
     research_state = {
         "topic": topic,
+
         "paper": {
             "url": paper_url,
             "page_count": paper["page_count"],
             "character_count": len(paper["text"]),
         },
+
         "chunks": {
             "total": len(chunks),
             "analyzed": len(analyses),
         },
+
         "analyses": analyses,
 
         "synthesis": synthesis,
+
+        "report": report,
     }
+
+    # --------------------------------------------------
+    # DONE
+    # --------------------------------------------------
 
     print("\n================================")
     print("      RESEARCHPIPELINE DONE")
