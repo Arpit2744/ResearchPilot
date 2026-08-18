@@ -4,21 +4,47 @@ from dataclasses import asdict
 
 from dotenv import load_dotenv
 from google import genai
+from mistralai.client import Mistral
 
 
 load_dotenv()
 
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
+# ============================================================
+# API CONFIGURATION
+# ============================================================
 
-if not API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY not found in .env")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 
-client = genai.Client(api_key=API_KEY)
+if not GOOGLE_API_KEY:
+    raise RuntimeError(
+        "GOOGLE_API_KEY not found in .env"
+    )
 
-MODEL = "gemini-3.6-flash"
+if not MISTRAL_API_KEY:
+    raise RuntimeError(
+        "MISTRAL_API_KEY not found in .env"
+    )
 
+
+gemini_client = genai.Client(
+    api_key=GOOGLE_API_KEY
+)
+
+mistral_client = Mistral(
+    api_key=MISTRAL_API_KEY
+)
+
+
+GEMINI_MODEL = "gemini-3.6-flash"
+MISTRAL_MODEL = "mistral-small-latest"
+
+
+# ============================================================
+# SYSTEM INSTRUCTION
+# ============================================================
 
 SYSTEM_INSTRUCTION = """
 You are a research synthesis agent.
@@ -49,6 +75,10 @@ IMPORTANT RULES:
 """
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def _serialize_analyses(analyses) -> list[dict]:
     """
     Convert ChunkAnalysis dataclasses into JSON-compatible dictionaries.
@@ -60,25 +90,34 @@ def _serialize_analyses(analyses) -> list[dict]:
     ]
 
 
-def synthesize_analyses(
+def _clean_json_response(text: str) -> str:
+    """
+    Remove accidental markdown code fences.
+    """
+
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "")
+        text = text.replace("```", "")
+        text = text.strip()
+
+    return text
+
+
+def _build_prompt(
     topic: str,
     analyses: list,
-) -> dict:
+) -> str:
     """
-    Synthesize multiple ChunkAnalysis objects into a research-level summary.
-
-    The synthesizer only sees information extracted from the paper chunks.
-    It does not retrieve external information.
+    Build the synthesis prompt shared by Gemini and Mistral.
     """
 
-    if not analyses:
-        raise ValueError(
-            "Cannot synthesize research without chunk analyses."
-        )
+    serialized = _serialize_analyses(
+        analyses
+    )
 
-    serialized = _serialize_analyses(analyses)
-
-    prompt = f"""
+    return f"""
 {SYSTEM_INSTRUCTION}
 
 Research topic:
@@ -90,7 +129,11 @@ Number of analyzed chunks:
 Chunk analyses:
 ----------------
 
-{json.dumps(serialized, indent=2, ensure_ascii=False)}
+{json.dumps(
+    serialized,
+    indent=2,
+    ensure_ascii=False,
+)}
 
 ----------------
 
@@ -129,25 +172,157 @@ Only include gaps that are explicitly supported by the
 provided chunk analyses or their limitations.
 
 Do not infer a research gap merely because information is missing.
+
+Return ONLY valid JSON.
 """
 
-    response = client.models.generate_content(
-        model=MODEL,
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+def _synthesize_with_gemini(
+    prompt: str,
+) -> dict:
+    """
+    Generate synthesis using Gemini.
+    """
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
         contents=prompt,
     )
 
-    text = response.text.strip()
+    text = response.text
 
-    # Remove accidental markdown code fences.
-    if text.startswith("```"):
-        text = text.replace("```json", "")
-        text = text.replace("```", "")
-        text = text.strip()
+    if not text:
+        raise ValueError(
+            "Gemini returned an empty synthesis response."
+        )
+
+    text = _clean_json_response(text)
+
+    return json.loads(text)
+
+
+# ============================================================
+# MISTRAL
+# ============================================================
+
+def _synthesize_with_mistral(
+    prompt: str,
+) -> dict:
+    """
+    Generate synthesis using Mistral.
+    """
+
+    response = mistral_client.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        response_format={
+            "type": "json_object"
+        },
+    )
+
+    text = response.choices[0].message.content
+
+    if not text:
+        raise ValueError(
+            "Mistral returned an empty synthesis response."
+        )
+
+    text = _clean_json_response(text)
+
+    return json.loads(text)
+
+
+# ============================================================
+# MAIN SYNTHESIZER
+# ============================================================
+
+def synthesize_analyses(
+    topic: str,
+    analyses: list,
+) -> dict:
+    """
+    Synthesize multiple ChunkAnalysis objects into a
+    research-level summary.
+
+    Provider order:
+
+        Gemini
+           ↓
+        Mistral fallback
+
+    Both providers return the same JSON structure.
+    """
+
+    if not analyses:
+        raise ValueError(
+            "Cannot synthesize research without chunk analyses."
+        )
+
+    prompt = _build_prompt(
+        topic=topic,
+        analyses=analyses,
+    )
+
+    # --------------------------------------------------------
+    # PRIMARY: GEMINI
+    # --------------------------------------------------------
 
     try:
-        return json.loads(text)
 
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Gemini returned invalid synthesis JSON:\n{text}"
-        ) from exc
+        print(
+            "      → Trying Gemini for synthesis..."
+        )
+
+        result = _synthesize_with_gemini(
+            prompt
+        )
+
+        print(
+            "      ✓ Gemini synthesis succeeded"
+        )
+
+        return result
+
+    except Exception as gemini_error:
+
+        print(
+            "      ⚠ Gemini synthesis failed: "
+            f"{type(gemini_error).__name__}"
+        )
+
+        print(
+            "      → Falling back to Mistral..."
+        )
+
+    # --------------------------------------------------------
+    # FALLBACK: MISTRAL
+    # --------------------------------------------------------
+
+    try:
+
+        result = _synthesize_with_mistral(
+            prompt
+        )
+
+        print(
+            "      ✓ Mistral synthesis succeeded"
+        )
+
+        return result
+
+    except Exception as mistral_error:
+
+        raise RuntimeError(
+            "Both Gemini and Mistral failed during synthesis.\n"
+            f"Gemini error: {gemini_error}\n"
+            f"Mistral error: {mistral_error}"
+        ) from mistral_error

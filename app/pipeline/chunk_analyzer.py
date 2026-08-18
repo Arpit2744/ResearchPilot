@@ -3,6 +3,7 @@ import os
 
 from dotenv import load_dotenv
 from google import genai
+from mistralai.client import Mistral
 
 from ..schemas.evidence import (
     ChunkAnalysis,
@@ -13,16 +14,43 @@ from ..schemas.evidence import (
 load_dotenv()
 
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
+# ============================================================
+# API CONFIGURATION
+# ============================================================
 
-if not API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY not found in .env")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 
-client = genai.Client(api_key=API_KEY)
+if not GOOGLE_API_KEY:
+    raise RuntimeError(
+        "GOOGLE_API_KEY not found in .env"
+    )
 
-MODEL = "gemini-3.6-flash"
+if not MISTRAL_API_KEY:
+    raise RuntimeError(
+        "MISTRAL_API_KEY not found in .env"
+    )
 
+
+gemini_client = genai.Client(
+    api_key=GOOGLE_API_KEY
+)
+
+mistral_client = Mistral(
+    api_key=MISTRAL_API_KEY
+)
+
+
+GEMINI_MODEL = "gemini-3.6-flash"
+
+# Use a Mistral model available to your API account.
+MISTRAL_MODEL = "mistral-small-latest"
+
+
+# ============================================================
+# SYSTEM INSTRUCTION
+# ============================================================
 
 SYSTEM_INSTRUCTION = """
 You are a research paper extraction agent.
@@ -47,12 +75,33 @@ Pay particular attention to:
 - evidence
 
 Every extracted item should include the exact supporting text as a short quote when possible.
+
+The output must contain ONLY valid JSON.
 """
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _clean_json_response(text: str) -> str:
+    """
+    Remove accidental markdown code fences from an LLM response.
+    """
+
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "")
+        text = text.replace("```", "")
+        text = text.strip()
+
+    return text
 
 
 def _to_evidence_items(items) -> list[EvidenceItem]:
     """
-    Convert Gemini JSON items into EvidenceItem objects.
+    Convert LLM JSON items into EvidenceItem objects.
     """
 
     if not isinstance(items, list):
@@ -73,16 +122,95 @@ def _to_evidence_items(items) -> list[EvidenceItem]:
         result.append(
             EvidenceItem(
                 text=str(text),
-                evidence=str(item.get("evidence", "")),
+                evidence=str(
+                    item.get("evidence", "")
+                ),
             )
         )
 
     return result
 
 
-def analyze_chunk(chunk) -> ChunkAnalysis:
+def _parse_chunk_analysis(
+    data: dict,
+    chunk,
+) -> ChunkAnalysis:
+    """
+    Convert normalized LLM JSON into ChunkAnalysis.
+    """
 
-    prompt = f"""
+    pages = data.get("pages", {})
+
+    if not isinstance(pages, dict):
+        pages = {}
+
+    return ChunkAnalysis(
+        chunk_id=str(
+            data.get(
+                "chunk_id",
+                chunk.chunk_id,
+            )
+        ),
+
+        start_page=int(
+            pages.get(
+                "start",
+                chunk.start_page,
+            )
+        ),
+
+        end_page=int(
+            pages.get(
+                "end",
+                chunk.end_page,
+            )
+        ),
+
+        claims=_to_evidence_items(
+            data.get("claims", [])
+        ),
+
+        problems=_to_evidence_items(
+            data.get("problems", [])
+        ),
+
+        methods=_to_evidence_items(
+            data.get("methods", [])
+        ),
+
+        datasets=_to_evidence_items(
+            data.get("datasets", [])
+        ),
+
+        metrics=_to_evidence_items(
+            data.get("metrics", [])
+        ),
+
+        results=_to_evidence_items(
+            data.get("results", [])
+        ),
+
+        limitations=_to_evidence_items(
+            data.get("limitations", [])
+        ),
+
+        technical_concepts=_to_evidence_items(
+            data.get("technical_concepts", [])
+        ),
+
+        evidence=_to_evidence_items(
+            data.get("evidence", [])
+        ),
+    )
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+def _build_prompt(chunk) -> str:
+
+    return f"""
 {SYSTEM_INSTRUCTION}
 
 Paper chunk:
@@ -127,80 +255,126 @@ Each extracted item should preferably have:
 Do not add information that isn't supported by the chunk.
 """
 
-    response = client.models.generate_content(
-        model=MODEL,
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+def _analyze_with_gemini(prompt: str) -> dict:
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
         contents=prompt,
     )
 
-    text = response.text.strip()
+    text = response.text
 
-    # Handle accidental markdown fences.
-    if text.startswith("```"):
-        text = text.replace("```json", "")
-        text = text.replace("```", "")
-        text = text.strip()
+    if not text:
+        raise ValueError(
+            "Gemini returned an empty response."
+        )
+
+    text = _clean_json_response(text)
+
+    return json.loads(text)
+
+
+# ============================================================
+# MISTRAL
+# ============================================================
+
+def _analyze_with_mistral(prompt: str) -> dict:
+
+    response = mistral_client.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        response_format={
+            "type": "json_object"
+        },
+    )
+
+    text = response.choices[0].message.content
+
+    if not text:
+        raise ValueError(
+            "Mistral returned an empty response."
+        )
+
+    text = _clean_json_response(text)
+
+    return json.loads(text)
+
+
+# ============================================================
+# MAIN ANALYZER
+# ============================================================
+
+def analyze_chunk(chunk) -> ChunkAnalysis:
+
+    prompt = _build_prompt(chunk)
+
+    # --------------------------------------------------------
+    # PRIMARY: GEMINI
+    # --------------------------------------------------------
 
     try:
-        data = json.loads(text)
 
-    except json.JSONDecodeError as exc:
+        print(
+            "        → Trying Gemini..."
+        )
 
-        raise ValueError(
-            f"Gemini returned invalid JSON:\n{text}"
-        ) from exc
+        data = _analyze_with_gemini(
+            prompt
+        )
 
-    return ChunkAnalysis(
-        chunk_id=str(
-            data.get("chunk_id", chunk.chunk_id)
-        ),
+        print(
+            "        ✓ Gemini succeeded"
+        )
 
-        start_page=int(
-            data.get("pages", {}).get(
-                "start",
-                chunk.start_page,
-            )
-        ),
+        return _parse_chunk_analysis(
+            data,
+            chunk,
+        )
 
-        end_page=int(
-            data.get("pages", {}).get(
-                "end",
-                chunk.end_page,
-            )
-        ),
+    except Exception as gemini_error:
 
-        claims=_to_evidence_items(
-            data.get("claims", [])
-        ),
+        print(
+            f"        ⚠ Gemini failed: "
+            f"{type(gemini_error).__name__}"
+        )
 
-        problems=_to_evidence_items(
-            data.get("problems", [])
-        ),
+        print(
+            "        → Falling back to Mistral..."
+        )
 
-        methods=_to_evidence_items(
-            data.get("methods", [])
-        ),
+    # --------------------------------------------------------
+    # FALLBACK: MISTRAL
+    # --------------------------------------------------------
 
-        datasets=_to_evidence_items(
-            data.get("datasets", [])
-        ),
+    try:
 
-        metrics=_to_evidence_items(
-            data.get("metrics", [])
-        ),
+        data = _analyze_with_mistral(
+            prompt
+        )
 
-        results=_to_evidence_items(
-            data.get("results", [])
-        ),
+        print(
+            "        ✓ Mistral succeeded"
+        )
 
-        limitations=_to_evidence_items(
-            data.get("limitations", [])
-        ),
+        return _parse_chunk_analysis(
+            data,
+            chunk,
+        )
 
-        technical_concepts=_to_evidence_items(
-            data.get("technical_concepts", [])
-        ),
+    except Exception as mistral_error:
 
-        evidence=_to_evidence_items(
-            data.get("evidence", [])
-        ),
-    )
+        raise RuntimeError(
+            "Both Gemini and Mistral failed.\n"
+            f"Gemini error: {gemini_error}\n"
+            f"Mistral error: {mistral_error}"
+        ) from mistral_error
